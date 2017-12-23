@@ -21,8 +21,15 @@ import argparse
 import threading
 import pygame
 import exifread
-import BaseHTTPServer
+from flask import Flask
+import flask
+import StringIO
 
+
+
+
+app = Flask(__name__)
+app.secret_key = 'extremely advanced catflap monitor'
 
 
 IMAGES = deque()
@@ -33,6 +40,13 @@ BUZZER = 18
 LED_RED = 27
 LED_GREEN = 22
 LED_YELLOW = 17
+SWITCH_BIG = 25
+SWITCH_SMALL = 24
+CATFLAP_TRIGGER = 21
+MUSIC_MAIN = 'cheshire.mp3'
+MUSIC_FUN = 'cheshire_fun.mp3'
+
+
 
 class CamImage:
 	def __init__(self, filename):
@@ -48,6 +62,14 @@ class Event:
 		for i in images:
 			i.isEvent = True
 		self.images = images
+		self.img_idx = 0
+
+	def getNextImage(self):
+		self.img_idx += 1
+		if self.img_idx >= len(self.images): self.img_idx = 0 
+		logging.debug("Event contains {} images, and index is {}".format(len(self.images), self.img_idx))
+		return self.images[self.img_idx]
+
 
 	def unlink(self):
 		try:
@@ -115,6 +137,9 @@ def takePhoto2(catcam):
 	if len(IMAGES) >= 500:
 		r = IMAGES.pop()
 		try:
+			# Images belonging to events are still referenced so do not delete here.
+			# they will be deleted elsewhere by the saveEvent processing. 
+			# isEvent would better be replaced with a reference counter idea.
 			if not r.isEvent:
 				os.unlink(r.filename)
 		except:
@@ -149,6 +174,8 @@ def saveEvent(images):
 	ev = Event(images)
 	global EVENTS
 	EVENTS.appendleft(ev)
+	# Delete old events. This would be better if called explicitly and isEvent
+	# changed to a reference counter.
 	if len(EVENTS) >= 5:
 		r = EVENTS.pop()
 		r.unlink()
@@ -160,6 +187,8 @@ def onCatFlapTriggered():
 	logging.info("Cat flap actually triggered...")
 
 	imgs = applyMotionFilter(list(itertools.islice(IMAGES, 0, 10)), ARGS.motion)
+	# Reverse so oldest image is first
+	imgs = list(reversed(imgs))
 
 	if len(imgs) == 0:
 		logging.info("No images to send after motion filter applied. False alarm folks!")
@@ -187,6 +216,7 @@ def onCatFlapTriggered_debouncer(channel):
 	
 	DEBOUNCE_TIMER = threading.Timer(5, onCatFlapTriggered)
 	DEBOUNCE_TIMER.start()
+	pygame.mixer.music.load(MUSIC_MAIN)
 	pygame.mixer.music.play()
 	for i in range(5):
 		GPIO.output(BUZZER, GPIO.HIGH)
@@ -195,7 +225,29 @@ def onCatFlapTriggered_debouncer(channel):
 		time.sleep(0.1)
 
 
+def onSmallSwitchPressed(channel):
+	logging.info("Small switch pressed")
+	onCatFlapTriggered_debouncer(channel)
+	
+def onBigSwitchPressed(channel):
+	logging.info("Big switch pressed")
+	pygame.mixer.music.load(MUSIC_FUN)
+	pygame.mixer.music.set_volume(1.0)
+	pygame.mixer.music.play()
+
+
 def ledLoop():
+
+	# led = LedDefault()
+
+	# while True:
+	# 	led.advance()
+	# 	time.sleep(led.delay)
+	# 	if bigButtonPressed:
+	# 		led = LedFlashing()
+	# 	else:
+	# 		led = LedDefault()
+
 	states = deque([True,False,False])
 	d = 1 
 	while True:
@@ -211,75 +263,50 @@ def ledLoop():
 		time.sleep(0.5)
 
 
-
-
-####################
-# Web Server
-#####################
-
-class MyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
-    def do_HEAD(s):
-        s.send_response(200)
-        s.send_header("Content-type", "text/plain")
-        s.end_headers()
-
-
-    def do_GET(s):
-        """Respond to a GET request."""
-        s.send_response(200)
-        if s.path.startswith('/favicon'):
-        	return
-
-        logging.info('HTTP request {}'.format(s.path))
-
-        if s.path.startswith('/trigger'):
-        	onCatFlapTriggered_debouncer(0)
-        	s.send_header("Content-type", "text/plain")
-        	s.end_headers()
-        	s.wfile.write('Triggered!')
-    		s.wfile.write('\n')	
-        	return
-
-
-        s.send_header("Content-type", "text/html")
-        s.end_headers()
-
-        s.wfile.write('Hello Pussy Cat!')
-    	s.wfile.write('\n')	
-
-
-	        
+def catPhotoTakerLoop():
+	fps = 3
+	catcam = None
+	while True:
+		try:
+			if not catcam:
+				catcam = urllib2.urlopen('http://db:8084/')
+			#Loop
+			before = datetime.now()
+			if not takePhoto2(catcam):
+				logging.error("Failed to retrieve image from camera. Not multipart?")
+				catcam = None
+			duration = (before - datetime.now()).total_seconds()
+			s = max(0, (1 / fps) - duration)
+			logging.info("Waiting for {} ".format(s))
+			time.sleep(s)
+		except:
+			logging.exception("Problem during cat image retrieval!!!")
+			catcam = None
+			time.sleep(10)
 
 
 
 
-class HTTPThread (threading.Thread):
-    def __init__(self, port):
-        threading.Thread.__init__(self)
-        self.port = port
-        self.daemon = True
+################FLASK WEB SERVER#########
+@app.route('/')
+def flask_root():
+	"""Flask Root"""
+	# TODO,  render last event images.
+	return flask.render_template('main.html', webcam_url = '/eventimg')
 
-    def run(self):
-        logging.info("Starting HTTP Thread" )
-        #self.run_http(self.port)
-        server_class = BaseHTTPServer.HTTPServer
-        httpd = server_class(('', self.port), MyHandler)
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            pass
-        httpd.server_close()
-        logging.info("Exiting HTTP Thread" )
+@app.route('/eventimg/')
+def flask_eventimg():
+	"""Return an image from the event list, rotating on each call"""
+	global EVENTS
+	if not EVENTS:
+		return flask.redirect('http://lorempixel.com/800/480/cats/')
+	img = EVENTS[0].getNextImage()
+	logging.debug("Flask Image Server. Sending browser file {}".format(img.filename))
+	return flask.send_file(img.filename, mimetype='image/jpeg')
 
 
-	def run_http(self, port):
-	    server_class = BaseHTTPServer.HTTPServer
-	    httpd = server_class(('', port), MyHandler)
-	    try:
-	        httpd.serve_forever()
-	    except KeyboardInterrupt:
-	        pass
-	    httpd.server_close()
+
+
 
 
 def main(): 
@@ -305,47 +332,44 @@ def main():
 	consoleHandler.setFormatter(logFormatter)
 	rootLogger.addHandler(consoleHandler)
 
+	app.logger.addHandler(fileHandler)
+
+
 	rootLogger.setLevel(logging.INFO)
 	GPIO.setmode(GPIO.BCM)
 
-	catFlapChannel = 21
-	GPIO.setup(catFlapChannel, GPIO.IN)
+	GPIO.setup(CATFLAP_TRIGGER, GPIO.IN)
+	GPIO.setup(SWITCH_BIG, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+	GPIO.setup(SWITCH_SMALL, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
 	# Buzzer channel
 	GPIO.setup(BUZZER, GPIO.OUT)
 	GPIO.setup(LED_YELLOW, GPIO.OUT)
 	GPIO.setup(LED_GREEN, GPIO.OUT)
 	GPIO.setup(LED_RED, GPIO.OUT)
 
-	GPIO.add_event_detect(catFlapChannel, GPIO.FALLING, callback=onCatFlapTriggered_debouncer, bouncetime=100)
-	
+	GPIO.add_event_detect(CATFLAP_TRIGGER, GPIO.FALLING, callback=onCatFlapTriggered_debouncer, bouncetime=100)
+	GPIO.add_event_detect(SWITCH_BIG, GPIO.FALLING, callback=onBigSwitchPressed, bouncetime=200)
+	GPIO.add_event_detect(SWITCH_SMALL, GPIO.FALLING, callback=onSmallSwitchPressed, bouncetime=200)
+
+
 	pygame.mixer.init()
-	pygame.mixer.music.load('cheshire.mp3')
-	#onCatFlapTriggered()
+	pygame.mixer.music.set_volume(1.0)
+	pygame.mixer.music.load(MUSIC_MAIN)
 
 	logging.info( "Cheshire Cat Flap Camera started. Monitoring...")
-	fps = 3
 
-	catcam = urllib2.urlopen('http://db:8084/')
 
 	ledThread = threading.Thread(target=ledLoop)
 	ledThread.daemon = True
 	ledThread.start()
 
-	httpThread = HTTPThread(ARGS.http_port)
-	httpThread.start()
+	catCamThread = threading.Thread(target=catPhotoTakerLoop)
+	catCamThread.daemon = True
+	catCamThread.start()
 
-	while True:
-		#Loop
-		before = datetime.now()
-		if not takePhoto2(catcam):
-			logging.error("Failed to retrieve image from camera. Not multipart?")
-			break
-		duration = (before - datetime.now()).total_seconds()
-		s = max(0, (1 / fps) - duration)
-		logging.info("Waiting for {} ".format(s))
-		time.sleep(s)
-
-	catcam.close()
+	# Start Flask
+	app.run(host='0.0.0.0', port=9090, debug=False)
 
 
 

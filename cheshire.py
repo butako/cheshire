@@ -11,7 +11,11 @@ from datetime import datetime
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
 from email.utils import COMMASPACE, formatdate
+import smtplib
+from PIL import Image
+import tempfile
 import logging
 import logging.handlers
 from collections import deque
@@ -24,7 +28,7 @@ import exifread
 from flask import Flask
 import flask
 import StringIO
-
+import shutil
 
 
 
@@ -79,27 +83,62 @@ class Event:
 			pass
 
 
+
 def send_mail(send_from, send_to, subject, text, files=None,
-              server="127.0.0.1"):
+              server="127.0.0.1", webserver_target_dir=None, webserver_urlbase=None):
     assert isinstance(send_to, list)
 
-    msg = MIMEMultipart()
+    msg = MIMEMultipart('alternative')
     msg['From'] = send_from
     msg['To'] = COMMASPACE.join(send_to)
     msg['Date'] = formatdate(localtime=True)
     msg['Subject'] = subject
 
-    msg.attach(MIMEText(text))
+    plain_part = MIMEText(text, 'plain')
+    msg.attach(plain_part)
 
+    html_part = """
+    	<html>
+    		<head></head>
+	    	<body>
+	    		<h2>Rosie Alert!!</h2>
+	    		{images}
+	    	</body>
+	   	</html> 
+    """
+
+
+    image_html = ''
+    idx = 0
     for f in files or []:
-        with open(f, "rb") as fil:
-            part = MIMEApplication(
-                fil.read(),
-                Name=basename(f)
-            )
-            part['Content-Disposition'] = 'attachment; filename="%s"' % basename(f)
-            msg.attach(part)
 
+    	# Copy original image to the webserver 
+    	if webserver_target_dir:
+    		shutil.copy(f, webserver_target_dir)
+
+
+    	# Add original image 
+        #with open(f, "rb") as fil:
+        #	msg_image = MIMEImage(fil.read())
+        #	msg_image.add_header('Content-ID','<image_large{}>'.format(idx))
+        #	msg.attach(msg_image)
+
+        # Now add as a thumbnail
+    	with tempfile.TemporaryFile() as thumb_file:
+    		img = Image.open(f)
+    		img.thumbnail( (350,350), Image.ANTIALIAS)
+    		img.save(thumb_file, 'JPEG', quality=20, optimize=True)
+    		thumb_file.seek(0)
+    		msg_image = MIMEImage(thumb_file.read())
+        	msg_image.add_header('Content-ID','<image{}>'.format(idx))
+        	msg.attach(msg_image)
+
+        image_html = '{orig}<a href="{urlbase}/{fname}"><img src="cid:image{idx}"/></a><br/>'.format(
+        					 orig=image_html, idx=idx, urlbase=webserver_urlbase, fname=basename(f))
+        idx += 1
+
+    html_part = html_part.format(images=image_html)
+    msg.attach(MIMEText(html_part, 'html'))
 
     smtp = smtplib.SMTP(server)
     smtp.sendmail(send_from, send_to, msg.as_string())
@@ -163,7 +202,7 @@ def applyMotionFilter(imgs, threshold):
 			if "Image ImageDescription" in exiftags:
 				motion = int(exiftags["Image ImageDescription"].values)
 				logging.info("EXIF Motion value {}, threshold {}.".format(motion, threshold))
-				if motion >= threshold:
+				if motion >= threshold :
 					f_imgs.append(i)
 	return f_imgs
 
@@ -182,11 +221,12 @@ def saveEvent(images):
 
 
 
-def onCatFlapTriggered():
+def onCatFlapTriggered(motion_threshold):
 	global IMAGES
-	logging.info("Cat flap actually triggered...")
 
-	imgs = applyMotionFilter(list(itertools.islice(IMAGES, 0, 10)), ARGS.motion)
+	logging.info("Cat flap actually triggered... {}".format(motion_threshold))
+
+	imgs = applyMotionFilter(list(itertools.islice(IMAGES, 0, 10)), motion_threshold)
 	# Reverse so oldest image is first
 	imgs = list(reversed(imgs))
 
@@ -202,8 +242,9 @@ def onCatFlapTriggered():
 	subject = "{} {}".format("ROSIE Alert", timestamp)
 	
 	send_mail(ARGS.mail_from, ARGS.mail_to, 
-			subject, 'Cat flap triggered',
-			[i.filename for i in imgs], ARGS.mail_smtp) 
+			subject, 'Cat Spotted!',
+			[i.filename for i in imgs], ARGS.mail_smtp, 
+			ARGS.webserver_target_dir, ARGS.webserver_urlbase) 
 
 
 
@@ -214,7 +255,7 @@ def onCatFlapTriggered_debouncer(channel):
 		logging.info("Bounce debounced.")
 		DEBOUNCE_TIMER.cancel()
 	
-	DEBOUNCE_TIMER = threading.Timer(5, onCatFlapTriggered)
+	DEBOUNCE_TIMER = threading.Timer(5, onCatFlapTriggered, [ARGS.motion])
 	DEBOUNCE_TIMER.start()
 	pygame.mixer.music.load(MUSIC_MAIN)
 	pygame.mixer.music.play()
@@ -304,7 +345,10 @@ def flask_eventimg():
 	logging.debug("Flask Image Server. Sending browser file {}".format(img.filename))
 	return flask.send_file(img.filename, mimetype='image/jpeg')
 
-
+@app.route('/trigger/')
+def trigger():
+	onCatFlapTriggered(0)
+	return 'Triggered with 0'
 
 
 
@@ -319,6 +363,9 @@ def main():
 	parser.add_argument('--output', help='Path to write images to', default = '.')
 	parser.add_argument('--http_port', help='Port number of HTTP server', default=9090)
 	parser.add_argument('--motion', help='Motion threshold to filter', default=20000, type = int)
+	# Support a separate webserver to save wear on SDCard (perhaps i am paranoid!)
+	parser.add_argument('--webserver_target_dir', help='Directory for serving captured images distributed by email')
+	parser.add_argument('--webserver_urlbase', help='Web address base for serving captured images distributed by email')
 
 
 	ARGS = parser.parse_args()
@@ -348,7 +395,7 @@ def main():
 	GPIO.setup(LED_GREEN, GPIO.OUT)
 	GPIO.setup(LED_RED, GPIO.OUT)
 
-	GPIO.add_event_detect(CATFLAP_TRIGGER, GPIO.FALLING, callback=onCatFlapTriggered_debouncer, bouncetime=100)
+	GPIO.add_event_detect(CATFLAP_TRIGGER, GPIO.FALLING, callback=onCatFlapTriggered_debouncer, bouncetime=300)
 	GPIO.add_event_detect(SWITCH_BIG, GPIO.FALLING, callback=onBigSwitchPressed, bouncetime=200)
 	GPIO.add_event_detect(SWITCH_SMALL, GPIO.FALLING, callback=onSmallSwitchPressed, bouncetime=200)
 

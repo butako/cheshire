@@ -67,6 +67,13 @@ class Event:
 			i.isEvent = True
 		self.images = images
 		self.img_idx = 0
+		self.id = datetime.now().strftime('%Y%m%d_%H%M%S')
+		store_dir = os.path.join(ARGS.persist_image_store_dir, self.id)
+		if not os.path.exists(store_dir):
+			os.makedirs(store_dir)
+		for i in images:
+			# Copy original image to the event store
+			shutil.copy(i.filename, store_dir)
 
 	def getNextImage(self):
 		self.img_idx += 1
@@ -85,7 +92,7 @@ class Event:
 
 
 def send_mail(send_from, send_to, subject, text, files=None,
-              server="127.0.0.1", webserver_target_dir=None, webserver_urlbase=None):
+              server="127.0.0.1", webserver_urlbase=None):
     assert isinstance(send_to, list)
 
     msg = MIMEMultipart('alternative')
@@ -112,18 +119,7 @@ def send_mail(send_from, send_to, subject, text, files=None,
     idx = 0
     for f in files or []:
 
-    	# Copy original image to the webserver 
-    	if webserver_target_dir:
-    		shutil.copy(f, webserver_target_dir)
-
-
-    	# Add original image 
-        #with open(f, "rb") as fil:
-        #	msg_image = MIMEImage(fil.read())
-        #	msg_image.add_header('Content-ID','<image_large{}>'.format(idx))
-        #	msg.attach(msg_image)
-
-        # Now add as a thumbnail
+        #  add as a thumbnail
     	with tempfile.TemporaryFile() as thumb_file:
     		img = Image.open(f)
     		img.thumbnail( (350,350), Image.ANTIALIAS)
@@ -139,8 +135,8 @@ def send_mail(send_from, send_to, subject, text, files=None,
 
     html_part = html_part.format(images=image_html)
     msg.attach(MIMEText(html_part, 'html'))
-
-    smtp = smtplib.SMTP(server)
+    smtp = smtplib.SMTP(server, 587)
+    smtp.set_debuglevel(True)
     smtp.sendmail(send_from, send_to, msg.as_string())
     smtp.close()
 
@@ -209,7 +205,7 @@ def applyMotionFilter(imgs, threshold):
 
 
 
-def saveEvent(images):
+def make_event(images):
 	ev = Event(images)
 	global EVENTS
 	EVENTS.appendleft(ev)
@@ -218,6 +214,8 @@ def saveEvent(images):
 	if len(EVENTS) >= 5:
 		r = EVENTS.pop()
 		r.unlink()
+	return ev
+
 
 
 
@@ -234,17 +232,20 @@ def onCatFlapTriggered(motion_threshold):
 		logging.info("No images to send after motion filter applied. False alarm folks!")
 		return
 
-	#Save the images for the web server
-	saveEvent(imgs)
+	# Make an event to retain the images long enough for other purposes, e.g.
+	# display on the monitor, send as email etc.
+	event = make_event(imgs)
 
 	logging.info("Sending photos: {}".format(imgs))
 	timestamp = datetime.now().strftime('%H:%M:%S')
 	subject = "{} {}".format("ROSIE Alert", timestamp)
-	
+
+
 	send_mail(ARGS.mail_from, ARGS.mail_to, 
-			subject, 'Cat Spotted!',
-			[i.filename for i in imgs], ARGS.mail_smtp, 
-			ARGS.webserver_target_dir, ARGS.webserver_urlbase) 
+				subject, 'Cat Spotted!',
+				[i.filename for i in imgs], ARGS.mail_smtp,
+			   '{}/{}'.format(ARGS.webserver_urlbase, event.id)
+			  )
 
 
 
@@ -332,7 +333,6 @@ def catPhotoTakerLoop():
 @app.route('/')
 def flask_root():
 	"""Flask Root"""
-	# TODO,  render last event images.
 	return flask.render_template('main.html', webcam_url = '/eventimg')
 
 @app.route('/eventimg/')
@@ -364,11 +364,16 @@ def main():
 	parser.add_argument('--http_port', help='Port number of HTTP server', default=9090)
 	parser.add_argument('--motion', help='Motion threshold to filter', default=20000, type = int)
 	# Support a separate webserver to save wear on SDCard (perhaps i am paranoid!)
-	parser.add_argument('--webserver_target_dir', help='Directory for serving captured images distributed by email')
+	parser.add_argument('--persist_image_store_dir', help='Directory for long term retaining event images.')
 	parser.add_argument('--webserver_urlbase', help='Web address base for serving captured images distributed by email')
 
 
 	ARGS = parser.parse_args()
+
+	if ARGS.webserver_urlbase and not ARGS.persist_image_store_dir:
+		print "Missing store for webserver"
+		return
+
 	logFormatter = logging.Formatter("%(asctime)s [%(levelname)-5.5s]  %(message)s")
 	rootLogger = logging.getLogger()
 	fileHandler = logging.handlers.RotatingFileHandler(ARGS.log, maxBytes=(1024*1024*1), backupCount=5)

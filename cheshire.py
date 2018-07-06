@@ -333,10 +333,30 @@ def catPhotoTakerLoop():
 @app.route('/')
 def flask_root():
 	"""Flask Root"""
-	return flask.render_template('main.html', webcam_url = '/eventimg')
+	return flask.render_template('main.html', webcam_url = '/imgcycle')
 
-@app.route('/eventimg/')
-def flask_eventimg():
+
+@app.route('/catflap/')
+def flask_log():
+	# list the top items form the persistence store back to the client in
+	# descending order
+	events = sorted(os.listdir(ARGS.persist_image_store_dir), reverse=True)
+	events = [e for e in events if os.path.isdir(os.path.join(ARGS.persist_image_store_dir, e))]
+	return flask.render_template('event_log.html', events = events)
+
+@app.route('/catflap/event/<event_id>')
+def flask_event(event_id):
+	images = sorted(os.listdir(os.path.join(ARGS.persist_image_store_dir, event_id)))
+	return flask.render_template('event_images.html', images = images, event_id = event_id)
+
+@app.route('/catflap/event/<event_id>/<image>')
+def flask_eventimg(event_id, image):
+	return flask.send_file(os.path.join(ARGS.persist_image_store_dir, event_id, image), mimetype='image/jpeg')
+
+
+
+@app.route('/imgcycle/')
+def flask_imgcycle():
 	"""Return an image from the event list, rotating on each call"""
 	global EVENTS
 	if not EVENTS:
